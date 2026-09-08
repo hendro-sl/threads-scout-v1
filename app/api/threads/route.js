@@ -2,67 +2,17 @@ import { NextResponse } from 'next/server';
 import { enrichPosts } from '../../../lib/scoring';
 
 const API = 'https://graph.threads.net/v1.0';
+const POST_FIELDS = 'id,media_type,permalink,username,text,timestamp,shortcode,is_quote_post,has_replies';
+const INSIGHT_METRICS = 'views,likes,replies,reposts,quotes';
 
-const demoPosts = (username) =>
-  enrichPosts([
-    {
-      id: 'demo-1',
-      username,
-      text: 'Most freelancers do not need another skill. They need proof that makes the skill easy to buy.',
-      timestamp: '2026-09-06T06:30:00Z',
-      permalink: 'https://www.threads.com',
-      likes: 1840,
-      replies: 218,
-      reposts: 331,
-      quotes: 91,
-      views: null,
-    },
-    {
-      id: 'demo-2',
-      username,
-      text: 'Your portfolio is not a gallery. It is a sales argument.',
-      timestamp: '2026-09-04T11:00:00Z',
-      permalink: 'https://www.threads.com',
-      likes: 730,
-      replies: 61,
-      reposts: 82,
-      quotes: 24,
-      views: null,
-    },
-    {
-      id: 'demo-3',
-      username,
-      text: 'I wasted months changing my Upwork profile when the real problem was the offer.',
-      timestamp: '2026-09-02T04:10:00Z',
-      permalink: 'https://www.threads.com',
-      likes: 3620,
-      replies: 447,
-      reposts: 615,
-      quotes: 140,
-      views: null,
-    },
-  ]);
-
-class ThreadsApiError extends Error {
-  constructor(message, details = {}) {
-    super(message);
-    this.name = 'ThreadsApiError';
-    this.status = details.status || 500;
-    this.apiCode = details.apiCode ?? null;
-    this.apiSubcode = details.apiSubcode ?? null;
-    this.apiType = details.apiType ?? null;
-    this.fbtraceId = details.fbtraceId ?? null;
-  }
-}
-
-async function threadsFetch(path, params = {}, token) {
+async function threadsFetch(path, params, token) {
   const url = new URL(`${API}${path}`);
 
-  for (const [key, value] of Object.entries(params)) {
+  Object.entries(params || {}).forEach(([key, value]) => {
     if (value !== undefined && value !== null && value !== '') {
       url.searchParams.set(key, String(value));
     }
-  }
+  });
 
   url.searchParams.set('access_token', token);
 
@@ -73,51 +23,86 @@ async function threadsFetch(path, params = {}, token) {
   });
 
   const raw = await response.text();
-  let json;
+  let json = {};
 
   try {
     json = raw ? JSON.parse(raw) : {};
   } catch {
-    throw new ThreadsApiError('Threads API returned a non-JSON response.', {
-      status: response.status,
-    });
+    const error = new Error('Threads API returned an invalid response.');
+    error.status = response.status;
+    throw error;
   }
 
   if (!response.ok || json?.error) {
     const apiError = json?.error || {};
-    throw new ThreadsApiError(
-      apiError.message || `Threads API request failed (${response.status}).`,
-      {
-        status: response.status,
-        apiCode: apiError.code,
-        apiSubcode: apiError.error_subcode,
-        apiType: apiError.type,
-        fbtraceId: apiError.fbtrace_id,
-      }
+    const error = new Error(
+      apiError.message || `Threads API request failed (${response.status}).`
     );
+
+    error.status = response.status;
+    error.code = apiError.code ?? null;
+    error.subcode = apiError.error_subcode ?? null;
+    error.type = apiError.type ?? null;
+    error.trace = apiError.fbtrace_id ?? null;
+    throw error;
   }
 
   return json;
 }
 
-function apiErrorResponse(error, stage) {
-  const permissionError = error?.apiCode === 10 || error?.status === 403;
+function metricValue(metric) {
+  if (!metric) return null;
+
+  if (typeof metric?.total_value?.value === 'number') {
+    return metric.total_value.value;
+  }
+
+  if (
+    Array.isArray(metric?.values) &&
+    typeof metric.values[0]?.value === 'number'
+  ) {
+    return metric.values[0].value;
+  }
+
+  return null;
+}
+
+function parseInsights(data = []) {
+  const metrics = Object.fromEntries(
+    data
+      .filter((item) => item?.name)
+      .map((item) => [item.name, item])
+  );
+
+  return {
+    views: metricValue(metrics.views),
+    likes: metricValue(metrics.likes),
+    replies: metricValue(metrics.replies),
+    reposts: metricValue(metrics.reposts),
+    quotes: metricValue(metrics.quotes),
+  };
+}
+
+function errorResponse(error, stage) {
+  const permissionError =
+    error?.status === 403 ||
+    error?.code === 10 ||
+    error?.code === 200;
 
   return NextResponse.json(
     {
-      error: permissionError
-        ? `Meta blocked "${stage}" because this app/token does not currently have the required access.`
-        : error?.message || 'Threads API request failed.',
+      error: error?.message || 'Threads API request failed.',
       stage,
       meta: {
-        code: error?.apiCode ?? null,
-        subcode: error?.apiSubcode ?? null,
-        type: error?.apiType ?? null,
-        trace: error?.fbtraceId ?? null,
+        code: error?.code ?? null,
+        subcode: error?.subcode ?? null,
+        type: error?.type ?? null,
+        trace: error?.trace ?? null,
       },
-      nextStep: permissionError
-        ? 'Token is connected, but public-profile research requires threads_profile_discovery access for this app. This is an access-level issue, not a Vercel or UI bug.'
-        : 'Check the token status with /api/threads?health=1.',
+      nextStep:
+        stage === 'post insights'
+          ? 'Regenerate the Threads token with threads_manage_insights, replace THREADS_ACCESS_TOKEN in Vercel, then redeploy.'
+          : 'Check /api/threads?health=1 to verify the token.',
     },
     { status: permissionError ? 403 : 502 }
   );
@@ -128,84 +113,19 @@ export async function GET(request) {
   const username = (searchParams.get('username') || '')
     .replace(/^@/, '')
     .trim();
-  const demo = searchParams.get('demo') === '1';
+
   const health = searchParams.get('health') === '1';
   const token = process.env.THREADS_ACCESS_TOKEN;
 
   if (!token) {
-    if (health) {
-      return NextResponse.json(
-        {
-          ok: false,
-          mode: 'no-token',
-          error: 'THREADS_ACCESS_TOKEN is not configured on this deployment.',
-        },
-        { status: 503 }
-      );
-    }
-
-    if (!username) {
-      return NextResponse.json(
-        { error: 'Username is required.' },
-        { status: 400 }
-      );
-    }
-
-    return NextResponse.json({
-      mode: 'demo',
-      profile: {
-        username,
-        name: username,
-        threads_biography:
-          'Demo data — add THREADS_ACCESS_TOKEN for live mode.',
-      },
-      posts: demoPosts(username),
-    });
-  }
-
-  if (health) {
-    try {
-      const me = await threadsFetch(
-        '/me',
-        {
-          fields:
-            'id,username,name,threads_profile_picture_url,threads_biography',
-        },
-        token
-      );
-
-      return NextResponse.json({
-        ok: true,
-        mode: 'live',
-        message: 'Threads token is valid.',
-        profile: {
-          id: me.id,
-          username: me.username,
-          name: me.name,
-        },
-      });
-    } catch (error) {
-      return apiErrorResponse(error, 'token health check');
-    }
-  }
-
-  if (!username) {
     return NextResponse.json(
-      { error: 'Username is required.' },
-      { status: 400 }
-    );
-  }
-
-  if (demo) {
-    return NextResponse.json({
-      mode: 'demo',
-      profile: {
-        username,
-        name: username,
-        threads_biography: 'Demo data.',
+      {
+        ok: false,
+        mode: 'no-token',
+        error: 'THREADS_ACCESS_TOKEN is not configured on this deployment.',
       },
-      posts: demoPosts(username),
-    });
+      { status: 503 }
+    );
   }
 
   let me;
@@ -220,40 +140,124 @@ export async function GET(request) {
       token
     );
   } catch (error) {
-    return apiErrorResponse(error, 'token validation');
+    return errorResponse(error, 'token validation');
   }
 
+  if (health) {
+    return NextResponse.json({
+      ok: true,
+      mode: 'live',
+      message: 'Threads token is valid.',
+      profile: {
+        id: me.id,
+        username: me.username,
+        name: me.name,
+      },
+    });
+  }
+
+  if (!username) {
+    return NextResponse.json(
+      { error: 'Username is required.' },
+      { status: 400 }
+    );
+  }
+
+  // Own account: fetch posts and official post-level insights.
   if ((me.username || '').toLowerCase() === username.toLowerCase()) {
+    let feed;
+
     try {
-      const feed = await threadsFetch(
+      feed = await threadsFetch(
         '/me/threads',
         {
-          fields:
-            'id,media_type,permalink,username,text,timestamp,shortcode,is_quote_post,has_replies',
-          limit: 100,
+          fields: POST_FIELDS,
+          limit: 25,
         },
         token
       );
-
-      const posts = (feed.data || []).map((p) => ({
-        ...p,
-        likes: null,
-        replies: null,
-        reposts: null,
-        quotes: null,
-        views: null,
-      }));
-
-      return NextResponse.json({
-        mode: 'live-own-account',
-        profile: me,
-        posts: enrichPosts(posts),
-      });
     } catch (error) {
-      return apiErrorResponse(error, 'own profile posts');
+      return errorResponse(error, 'own profile posts');
     }
+
+    const rawPosts = feed.data || [];
+
+    const insightResults = await Promise.allSettled(
+      rawPosts.map(async (post) => {
+        const insightJson = await threadsFetch(
+          `/${post.id}/insights`,
+          {
+            metric: INSIGHT_METRICS,
+          },
+          token
+        );
+
+        return {
+          ...post,
+          ...parseInsights(insightJson.data || []),
+        };
+      })
+    );
+
+    const posts = [];
+    const insightErrors = [];
+
+    insightResults.forEach((result, index) => {
+      if (result.status === 'fulfilled') {
+        posts.push(result.value);
+      } else {
+        const post = rawPosts[index];
+
+        posts.push({
+          ...post,
+          views: null,
+          likes: null,
+          replies: null,
+          reposts: null,
+          quotes: null,
+        });
+
+        insightErrors.push({
+          postId: post.id,
+          message:
+            result.reason?.message || 'Unable to load post insights.',
+          code: result.reason?.code ?? null,
+          status: result.reason?.status ?? null,
+        });
+      }
+    });
+
+    if (
+      rawPosts.length > 0 &&
+      insightErrors.length === rawPosts.length
+    ) {
+      return NextResponse.json(
+        {
+          error:
+            'Posts loaded, but Meta did not allow post insights for this token.',
+          stage: 'post insights',
+          meta: insightErrors[0],
+          nextStep:
+            'Regenerate the Threads token with threads_manage_insights, replace THREADS_ACCESS_TOKEN in Vercel, then redeploy.',
+        },
+        { status: 403 }
+      );
+    }
+
+    return NextResponse.json({
+      mode: 'live-own-account',
+      profile: me,
+      insights: {
+        requested: rawPosts.length,
+        loaded: rawPosts.length - insightErrors.length,
+        failed: insightErrors.length,
+      },
+      posts: enrichPosts(posts),
+    });
   }
 
+  // Public account research.
+  // We load public posts, but do not request owner-only post insights.
   let profile;
 
   try {
@@ -267,7 +271,7 @@ export async function GET(request) {
       token
     );
   } catch (error) {
-    return apiErrorResponse(error, 'public profile lookup');
+    return errorResponse(error, 'public profile lookup');
   }
 
   try {
@@ -275,28 +279,29 @@ export async function GET(request) {
       '/profile_posts',
       {
         username,
-        fields:
-          'id,media_type,permalink,username,text,timestamp,shortcode,is_quote_post,has_replies',
-        limit: 100,
+        fields: POST_FIELDS,
+        limit: 50,
       },
       token
     );
 
-    const posts = (feed.data || []).map((p) => ({
-      ...p,
+    const posts = (feed.data || []).map((post) => ({
+      ...post,
+      views: null,
       likes: null,
       replies: null,
       reposts: null,
       quotes: null,
-      views: null,
     }));
 
     return NextResponse.json({
       mode: 'live-public-profile',
       profile,
+      note:
+        'Public posts loaded. Owner-only post insights are intentionally not requested for competitor accounts.',
       posts: enrichPosts(posts),
     });
   } catch (error) {
-    return apiErrorResponse(error, 'public profile posts');
+    return errorResponse(error, 'public profile posts');
   }
 }
