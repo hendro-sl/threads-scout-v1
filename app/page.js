@@ -96,6 +96,47 @@ export default function Home() {
   const [saved, setSaved] = useState({});
   const [cacheMeta, setCacheMeta] = useState(null);
   const [lastRequest, setLastRequest] = useState(null);
+  const [auth, setAuth] = useState({ loading: true, connected: false, source: 'none', scopesKnown: false, discoveryReady: null, insightsReady: null });
+  const [authNotice, setAuthNotice] = useState(null);
+
+
+
+  async function loadAuthStatus() {
+    try {
+      const response = await fetch('/api/auth/threads/status', { cache: 'no-store' });
+      const data = await response.json();
+      setAuth({ loading: false, ...data });
+    } catch {
+      setAuth({ loading: false, connected: false, source: 'unknown', scopesKnown: false, discoveryReady: null });
+    }
+  }
+
+  useEffect(() => {
+    loadAuthStatus();
+    const params = new URLSearchParams(window.location.search);
+    const oauth = params.get('oauth');
+    const oauthError = params.get('oauth_error');
+    if (oauth === 'connected') {
+      setAuthNotice({ type: 'success', message: 'Threads connected. Permission status is being verified.' });
+    } else if (oauthError) {
+      const messages = {
+        config_missing: 'OAuth configuration is incomplete in Vercel.',
+        authorization_denied: 'Threads authorization was cancelled or denied.',
+        state_mismatch: 'OAuth security check failed. Start Connect Threads again.',
+        token_exchange_failed: 'Meta returned to the app, but the token exchange failed. Check the OAuth configuration before retrying.',
+      };
+      setAuthNotice({ type: 'error', message: messages[oauthError] || 'Threads connection failed.' });
+    }
+    if (oauth || oauthError) {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  }, []);
+
+  async function disconnectThreads() {
+    await fetch('/api/auth/threads/disconnect', { method: 'POST' });
+    setAuthNotice({ type: 'success', message: 'Browser OAuth session disconnected. The legacy Vercel token, if present, is unchanged.' });
+    await loadAuthStatus();
+  }
 
   useEffect(() => {
     try {
@@ -151,6 +192,24 @@ export default function Home() {
     }
 
     const target = clean || 'demo_creator';
+
+    const ownUsername = auth?.profile?.username?.toLowerCase();
+    const isKnownPublicTarget =
+      !forceDemo &&
+      ownUsername &&
+      target.toLowerCase() !== ownUsername;
+
+    if (isKnownPublicTarget && auth.scopesKnown && auth.discoveryReady === false) {
+      setError({
+        code: 'PROFILE_DISCOVERY_MISSING',
+        title: 'Public-account permission is missing',
+        message: 'This token does not include threads_profile_discovery, so Meta will reject public-account research.',
+        action: 'Click Connect / Reconnect Threads and approve the requested permissions. Do not change code or Vercel tokens.',
+        retryable: false,
+      });
+      return;
+    }
+
     setUsername(target);
     setLoading(true);
     setError(null);
@@ -286,7 +345,7 @@ export default function Home() {
   return (
     <main>
       <section className="hero">
-        <div className="eyebrow">THREADS CONTENT INTELLIGENCE · V1.1</div>
+        <div className="eyebrow">THREADS CONTENT INTELLIGENCE · V1.2</div>
         <h1>
           Research posts without <span>fake metrics.</span>
         </h1>
@@ -294,6 +353,47 @@ export default function Home() {
           Search a Threads account, inspect public content, and rank your own posts
           when official Insights are available.
         </p>
+
+        <section className="auth-panel" aria-live="polite">
+          <div className="auth-copy">
+            <small>THREADS CONNECTION</small>
+            {auth.loading ? (
+              <strong>Checking connection…</strong>
+            ) : auth.connected ? (
+              <>
+                <strong>Connected{auth.profile?.username ? ` as @${auth.profile.username}` : ''}</strong>
+                <span>
+                  {auth.source === 'oauth' ? 'OAuth session' : 'Legacy Vercel token'}
+                  {' · '}
+                  {auth.scopesKnown
+                    ? auth.discoveryReady
+                      ? 'Public profile discovery ready'
+                      : 'Public profile discovery missing'
+                    : 'Permission list unavailable'}
+                </span>
+              </>
+            ) : (
+              <>
+                <strong>Threads is not connected</strong>
+                <span>Connect through Meta OAuth so the app can request the exact research permissions.</span>
+              </>
+            )}
+          </div>
+          <div className="auth-actions">
+            <a className="connect-button" href="/api/auth/threads/start">
+              {auth.connected ? 'Reconnect Threads' : 'Connect Threads'}
+            </a>
+            {auth.source === 'oauth' && (
+              <button className="auth-disconnect" onClick={disconnectThreads}>Disconnect</button>
+            )}
+          </div>
+        </section>
+
+        {authNotice && (
+          <div className={`auth-notice ${authNotice.type === 'error' ? 'auth-notice-error' : ''}`}>
+            {authNotice.message}
+          </div>
+        )}
 
         <div className="searchbox">
           <span>@</span>
