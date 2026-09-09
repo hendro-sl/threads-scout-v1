@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { enrichPosts } from '../../../lib/scoring';
+import { getThreadsCredential } from '../../../lib/threads-session';
 
 const API = 'https://graph.threads.net/v1.0';
 const POST_FIELDS =
@@ -186,7 +187,7 @@ function classifyError(error, stage, id) {
       code: 'TOKEN_INVALID',
       title: 'Threads token needs attention',
       message: 'The current Threads access token is invalid or expired.',
-      action: 'Generate a new Threads access token, replace THREADS_ACCESS_TOKEN in Vercel, then redeploy.',
+      action: 'Reconnect Threads from the app. If you are intentionally using the legacy Vercel token, replace that token only after confirming it is invalid.',
     };
     httpStatus = 401;
   } else if (status === 403 || code === 10 || code === 200) {
@@ -195,7 +196,7 @@ function classifyError(error, stage, id) {
       code: 'PERMISSION_REQUIRED',
       title: 'Permission required',
       message: 'The token is connected, but Meta has not allowed this operation for the current app/token.',
-      action: 'Check the Threads permission required for this feature. Do not change Vercel unless the token itself changed.',
+      action: 'Reconnect Threads and confirm the required scope is granted. Do not change code or rotate unrelated credentials.',
     };
     httpStatus = 403;
   } else if (status === 429 || [4, 17, 32, 613].includes(code)) {
@@ -397,7 +398,9 @@ export async function GET(request) {
   const username = cleanUsername(searchParams.get('username'));
   const health = searchParams.get('health') === '1';
   const forceDemo = searchParams.get('demo') === '1';
-  const token = process.env.THREADS_ACCESS_TOKEN;
+  const credential = await getThreadsCredential();
+  const token = credential.token;
+  const authSource = credential.source;
 
   if (forceDemo) {
     const demoName = username || 'demo_creator';
@@ -426,8 +429,8 @@ export async function GET(request) {
           error: {
             code: 'CONFIG_MISSING',
             title: 'Threads token is not configured',
-            message: 'THREADS_ACCESS_TOKEN is missing from this deployment.',
-            action: 'Add the token in Vercel Environment Variables and redeploy.',
+            message: 'No Threads connection is available for this browser and THREADS_ACCESS_TOKEN is not configured as a fallback.',
+            action: 'Use Connect Threads on the home page. The legacy Vercel token remains an optional fallback.',
             retryable: false,
             stage: 'configuration',
             requestId: id,
@@ -453,7 +456,7 @@ export async function GET(request) {
       warnings: [
         {
           code: 'CONFIG_MISSING',
-          message: 'Showing demo data because THREADS_ACCESS_TOKEN is not configured.',
+          message: 'Showing demo data because Threads is not connected in this browser and no legacy fallback token is configured.',
         },
       ],
     });
@@ -484,6 +487,7 @@ export async function GET(request) {
         username: me.username,
         name: me.name,
       },
+      authSource,
     });
   }
 
